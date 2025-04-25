@@ -203,17 +203,50 @@ func GetRegisteredConnectors() []RegisteredConnector {
 			IsConnector: func(s string) bool {
 				return strings.EqualFold(s, "dynamodb") || strings.EqualFold(s, "dynamodb://localstack")
 			},
-			Create: CreateHelper("DynamoDB", "dynamodb OR dynamodb://localstack", nil, func(_ *cli.Context, args []string, _ AdditionalSettings) (adiomv1connect.ConnectorServiceHandler, error) {
-				if strings.EqualFold(args[0], "dynamodb://localstack") {
-					_, connString, ok := strings.Cut(args[0], "://")
-					if !ok {
-						return nil, fmt.Errorf("invalid connection string %v", args[0])
+			Create: CreateHelper("DynamoDB", "dynamodb OR dynamodb://localstack [--aws-region <region>] [--role-arn <arn>]",
+				// Define flags for DynamoDB specific options
+				[]cli.Flag{
+					altsrc.NewStringFlag(&cli.StringFlag{
+						Name:  "aws-region", // Corresponds to 'aws_region' in YAML
+						Usage: "AWS region for the DynamoDB connector",
+					}),
+					altsrc.NewStringFlag(&cli.StringFlag{
+						Name:  "role-arn", // Corresponds to 'roleArn' in YAML
+						Usage: "IAM Role ARN to assume for cross-account access",
+					}),
+					// Add any other DynamoDB specific flags here if needed in the future
+				},
+				// Modify the action function to use the flag values
+				func(c *cli.Context, args []string, _ AdditionalSettings) (adiomv1connect.ConnectorServiceHandler, error) {
+					var connString string
+					if strings.EqualFold(args[0], "dynamodb://localstack") {
+						_, cs, ok := strings.Cut(args[0], "://")
+						if !ok {
+							return nil, fmt.Errorf("invalid connection string %v", args[0])
+						}
+						connString = cs // Should be "localstack"
+					} else {
+						connString = "" // Represents default AWS
 					}
-					return dynamodb.NewConn(connString), nil
-				} else {
-					return dynamodb.NewConn(""), nil
-				}
-			}),
+
+					// Extract values from flags (populated by CLI or altsrc from YAML)
+					awsRegion := c.String("aws-region")
+					roleArn := c.String("role-arn")
+
+					// Prepare options for NewConn
+					var dynamoOpts []func(*dynamodb.Options)
+					if awsRegion != "" {
+						slog.Debug("DynamoDB connector using specific region", "region", awsRegion)
+						dynamoOpts = append(dynamoOpts, dynamodb.WithAWSRegion(awsRegion))
+					}
+					if roleArn != "" {
+						slog.Debug("DynamoDB connector using specific role ARN", "roleArn", roleArn)
+						dynamoOpts = append(dynamoOpts, dynamodb.WithRoleARN(roleArn))
+					}
+
+					// Call NewConn with the connection string and the collected options
+					return dynamodb.NewConn(connString, dynamoOpts...), nil
+				}),
 		},
 		{
 			Name: "CosmosDB",

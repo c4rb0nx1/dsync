@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time" // Import time for AssumeRole session duration
 
 	"connectrpc.com/connect"
 	"github.com/adiom-data/dsync/connectors/dynamodb/stream"
@@ -18,6 +19,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodbstreams"
 	"golang.org/x/sync/errgroup"
+	"github.com/aws/aws-sdk-go-v2/credentials/stscreds" // <-- Import STS credentials helper
+	"github.com/aws/aws-sdk-go-v2/service/sts" // <-- Import STS service
 )
 
 type conn struct {
@@ -351,52 +354,139 @@ func (c *conn) WriteUpdates(context.Context, *connect.Request[adiomv1.WriteUpdat
 	// return nil, connect.NewError(connect.CodeUnimplemented, errors.ErrUnsupported)
 }
 
-func AWSClientHelper(connStr string) (*dynamodb.Client, *dynamodbstreams.Client) {
-	var endpoint string
-	if connStr == "localstack" {
-		endpoint = "http://localhost:4566"
-	}
-	awsConfig, err := config.LoadDefaultConfig(context.Background())
+func AWSClientHelper(connStr, region, roleArn string) (*dynamodb.Client, *dynamodbstreams.Client) {
+	initialConfig, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {
-		panic(err)
+		// Using panic here because credentials are fundamental.
+		panic(fmt.Sprintf("failed to load initial AWS config: %v", err))
 	}
-	dynamoClient := dynamodb.NewFromConfig(awsConfig, func(o *dynamodb.Options) {
-		if endpoint != "" {
-			o.BaseEndpoint = aws.String(endpoint)
+
+	// Keep a reference to the config we will actually use
+	var effectiveConfig aws.Config = initialConfig
+
+	// 2. Check if a roleArn is provided for cross-account access
+	if roleArn != "" {
+		slog.Info("Assuming IAM role for cross-account access", "roleArn", roleArn)
+		// 3. Create an STS client using the initial configuration
+		stsClient := sts.NewFromConfig(initialConfig)
+
+		// 4. Create an AssumeRoleProvider. This provider handles getting temporary credentials.
+		//    We use a session name to identify this specific dsync session in CloudTrail.
+		//    The provider will automatically refresh credentials as needed.
+		assumeRoleProvider := stscreds.NewAssumeRoleProvider(stsClient, roleArn, func(o *stscreds.AssumeRoleOptions) {
+			o.RoleSessionName = "dsync-session-" + fmt.Sprintf("%d", time.Now().Unix())
+			// You can customize the duration if needed, default is 1 hour
+			// o.Duration = 15 * time.Minute
+		})
+
+		// 5. Create a *new* effective configuration using the assumed role credentials
+		//    Start by copying the initial config, then override credentials.
+		assumedRoleConfig := initialConfig.Copy()
+		assumedRoleConfig.Credentials = aws.NewCredentialsCache(assumeRoleProvider)
+		effectiveConfig = assumedRoleConfig // Use this config going forward
+	} else {
+		slog.Info("Using default AWS credentials (e.g., EC2 instance profile or environment variables)")
+		// No roleArn provided, effectiveConfig remains initialConfig
+	}
+
+	// 6. Apply region if specified in the options
+	if region != "" {
+		effectiveConfig.Region = region
+		slog.Debug("Setting AWS region", "region", effectiveConfig.Region)
+	} else if effectiveConfig.Region == "" {
+		slog.Warn("No AWS region specified in config or found via default AWS resolution. Relying on SDK defaults.")
+	} else {
+		slog.Debug("Using AWS region from default resolution", "region", effectiveConfig.Region)
+	}
+
+	// 7. Handle endpoint override (e.g., for localstack)
+	//    This needs to be applied to the *final* effectiveConfig.
+	var endpointResolver aws.EndpointResolverWithOptionsFunc
+	if connStr == "localstack" {
+		localstackEndpoint := "http://localhost:4566"
+		slog.Debug("Configuring for localstack", "endpoint", localstackEndpoint)
+		endpointResolver = func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+			// Ignore the service/region passed, always return the localstack endpoint
+			return aws.Endpoint{
+				PartitionID:   "aws",
+				URL:           localstackEndpoint,
+				SigningRegion: effectiveConfig.Region, // Use the determined region for signing
+			}, nil
 		}
-	})
-	streamsClient := dynamodbstreams.NewFromConfig(awsConfig, func(o *dynamodbstreams.Options) {
-		if endpoint != "" {
-			o.BaseEndpoint = aws.String(endpoint)
+	}
+
+	// 8. Create the DynamoDB client using the effectiveConfig
+	dynamoClient := dynamodb.NewFromConfig(effectiveConfig, func(o *dynamodb.Options) {
+		if endpointResolver != nil {
+			o.EndpointResolverV2 = endpointResolver
 		}
+		// Deprecated way (prefer EndpointResolverV2 if possible):
+		// if connStr == "localstack" {
+		// 	o.BaseEndpoint = aws.String("http://localhost:4566")
+		// }
 	})
+
+	// 9. Create the DynamoDB Streams client using the effectiveConfig
+	streamsClient := dynamodbstreams.NewFromConfig(effectiveConfig, func(o *dynamodbstreams.Options) {
+		if endpointResolver != nil {
+			o.EndpointResolverV2 = endpointResolver
+		}
+		// Deprecated way:
+		// if connStr == "localstack" {
+		// 	o.BaseEndpoint = aws.String("http://localhost:4566")
+		// }
+	})
+
 	return dynamoClient, streamsClient
 }
 
 type Options struct {
 	DocsPerSegment  int
 	PlanParallelism int
+	RoleARN         string
+	AWSRegion       string 
+}
+
+func WithRoleARN(roleARN string) func(*Options) {
+    return func(o *Options) {
+        o.RoleARN = roleARN
+    }
+}
+
+func WithAWSRegion(region string) func(*Options) {
+    return func(o *Options) {
+        o.AWSRegion = region
+    }
 }
 
 func NewConn(connStr string, optFns ...func(*Options)) adiomv1connect.ConnectorServiceHandler {
 	opts := Options{
 		DocsPerSegment:  50000,
 		PlanParallelism: 4,
+		// Initialize RoleARN and AWSRegion to empty strings
+		RoleARN:   "",
+		AWSRegion: "",
 	}
 	for _, fn := range optFns {
-		fn(&opts)
+		fn(&opts) // Apply RoleARN, AWSRegion from config if provided
 	}
 
-	dynamoClient, streamsClient := AWSClientHelper(connStr)
-	spec := "aws"
+	// Pass the options to AWSClientHelper
+	// The helper now handles AssumeRole based on opts.RoleARN
+	dynamoClient, streamsClient := AWSClientHelper(connStr, opts.AWSRegion, opts.RoleARN)
+
+	// Determine the spec based on connStr and potentially role presence
+	spec := "aws" // Default to AWS
 	if connStr == "localstack" {
 		spec = connStr
+	} else if opts.RoleARN != "" {
+		spec = "aws-cross-account" // Or just keep 'aws'? Your choice.
 	}
 
 	client := NewClient(dynamoClient, streamsClient)
 	return &conn{
 		client:        client,
-		streamsClient: streamsClient,
+		streamsClient: streamsClient, // Store streamsClient for StreamUpdates method
 		options:       opts,
 		spec:          spec,
 	}
