@@ -11,6 +11,7 @@ import (
 	"time" // Import time for AssumeRole session duration
 
 	"connectrpc.com/connect"
+	smithyendpoints "github.com/aws/smithy-go/endpoints"
 	"github.com/adiom-data/dsync/connectors/dynamodb/stream"
 	adiomv1 "github.com/adiom-data/dsync/gen/adiom/v1"
 	"github.com/adiom-data/dsync/gen/adiom/v1/adiomv1connect"
@@ -354,90 +355,96 @@ func (c *conn) WriteUpdates(context.Context, *connect.Request[adiomv1.WriteUpdat
 	// return nil, connect.NewError(connect.CodeUnimplemented, errors.ErrUnsupported)
 }
 
+// AWSClientHelper creates AWS service clients, potentially using AssumeRole.
 func AWSClientHelper(connStr, region, roleArn string) (*dynamodb.Client, *dynamodbstreams.Client) {
-	initialConfig, err := config.LoadDefaultConfig(context.Background())
-	if err != nil {
-		// Using panic here because credentials are fundamental.
-		panic(fmt.Sprintf("failed to load initial AWS config: %v", err))
-	}
+    initialConfig, err := config.LoadDefaultConfig(context.Background())
+    if err != nil {
+        panic(fmt.Sprintf("failed to load initial AWS config: %v", err))
+    }
 
-	// Keep a reference to the config we will actually use
-	var effectiveConfig aws.Config = initialConfig
+    var effectiveConfig aws.Config = initialConfig
 
-	// 2. Check if a roleArn is provided for cross-account access
-	if roleArn != "" {
-		slog.Info("Assuming IAM role for cross-account access", "roleArn", roleArn)
-		// 3. Create an STS client using the initial configuration
-		stsClient := sts.NewFromConfig(initialConfig)
+    if roleArn != "" {
+        slog.Info("Assuming IAM role for cross-account access", "roleArn", roleArn)
+        stsClient := sts.NewFromConfig(initialConfig)
+        assumeRoleProvider := stscreds.NewAssumeRoleProvider(stsClient, roleArn, func(o *stscreds.AssumeRoleOptions) {
+            o.RoleSessionName = "dsync-session-" + fmt.Sprintf("%d", time.Now().Unix())
+        })
+        assumedRoleConfig := initialConfig.Copy()
+        assumedRoleConfig.Credentials = aws.NewCredentialsCache(assumeRoleProvider)
+        effectiveConfig = assumedRoleConfig
+    } else {
+        slog.Info("Using default AWS credentials (e.g., EC2 instance profile or environment variables)")
+    }
 
-		// 4. Create an AssumeRoleProvider. This provider handles getting temporary credentials.
-		//    We use a session name to identify this specific dsync session in CloudTrail.
-		//    The provider will automatically refresh credentials as needed.
-		assumeRoleProvider := stscreds.NewAssumeRoleProvider(stsClient, roleArn, func(o *stscreds.AssumeRoleOptions) {
-			o.RoleSessionName = "dsync-session-" + fmt.Sprintf("%d", time.Now().Unix())
-			// You can customize the duration if needed, default is 1 hour
-			// o.Duration = 15 * time.Minute
-		})
+    if region != "" {
+        effectiveConfig.Region = region
+        slog.Debug("Setting AWS region", "region", effectiveConfig.Region)
+    } else if effectiveConfig.Region == "" {
+        slog.Warn("No AWS region specified in config or found via default AWS resolution. Relying on SDK defaults.")
+    } else {
+        slog.Debug("Using AWS region from default resolution", "region", effectiveConfig.Region)
+    }
 
-		// 5. Create a *new* effective configuration using the assumed role credentials
-		//    Start by copying the initial config, then override credentials.
-		assumedRoleConfig := initialConfig.Copy()
-		assumedRoleConfig.Credentials = aws.NewCredentialsCache(assumeRoleProvider)
-		effectiveConfig = assumedRoleConfig // Use this config going forward
-	} else {
-		slog.Info("Using default AWS credentials (e.g., EC2 instance profile or environment variables)")
-		// No roleArn provided, effectiveConfig remains initialConfig
-	}
+    // Create the DynamoDB client using the effectiveConfig
+    dynamoClient := dynamodb.NewFromConfig(effectiveConfig, func(o *dynamodb.Options) {
+        // Implement the specific EndpointResolverV2 interface if using localstack
+        if connStr == "localstack" {
+            localstackEndpoint := "http://localhost:4566"
+            slog.Debug("Configuring DynamoDB client for localstack", "endpoint", localstackEndpoint)
 
-	// 6. Apply region if specified in the options
-	if region != "" {
-		effectiveConfig.Region = region
-		slog.Debug("Setting AWS region", "region", effectiveConfig.Region)
-	} else if effectiveConfig.Region == "" {
-		slog.Warn("No AWS region specified in config or found via default AWS resolution. Relying on SDK defaults.")
-	} else {
-		slog.Debug("Using AWS region from default resolution", "region", effectiveConfig.Region)
-	}
+            o.EndpointResolverV2 = dynamodb.EndpointResolverV2Func(
+                func(ctx context.Context, params dynamodb.EndpointParameters) (smithyendpoints.Endpoint, error) {
+                    uri, err := aws.ParseURL(localstackEndpoint)
+                    if err != nil {
+                        return smithyendpoints.Endpoint{}, fmt.Errorf("failed to parse localstack endpoint URL: %w", err)
+                    }
+                    return smithyendpoints.Endpoint{
+                        URI: *uri,
+                        Properties: smithyendpoints.Properties{
+                            "authSchemes": []smithyendpoints.AuthScheme{
+                                {
+                                    Name:          "sigv4",
+                                    SigningName:   aws.String("dynamodb"),
+                                    SigningRegion: aws.String(effectiveConfig.Region),
+                                },
+                            },
+                        },
+                    }, nil
+                })
+        }
+    })
 
-	// 7. Handle endpoint override (e.g., for localstack)
-	//    This needs to be applied to the *final* effectiveConfig.
-	var endpointResolver aws.EndpointResolverWithOptionsFunc
-	if connStr == "localstack" {
-		localstackEndpoint := "http://localhost:4566"
-		slog.Debug("Configuring for localstack", "endpoint", localstackEndpoint)
-		endpointResolver = func(service, region string, options ...interface{}) (aws.Endpoint, error) {
-			// Ignore the service/region passed, always return the localstack endpoint
-			return aws.Endpoint{
-				PartitionID:   "aws",
-				URL:           localstackEndpoint,
-				SigningRegion: effectiveConfig.Region, // Use the determined region for signing
-			}, nil
-		}
-	}
+    // Create the DynamoDB Streams client using the effectiveConfig
+    streamsClient := dynamodbstreams.NewFromConfig(effectiveConfig, func(o *dynamodbstreams.Options) {
+        // Implement the specific EndpointResolverV2 interface if using localstack
+        if connStr == "localstack" {
+            localstackEndpoint := "http://localhost:4566"
+            slog.Debug("Configuring DynamoDB Streams client for localstack", "endpoint", localstackEndpoint)
 
-	// 8. Create the DynamoDB client using the effectiveConfig
-	dynamoClient := dynamodb.NewFromConfig(effectiveConfig, func(o *dynamodb.Options) {
-		if endpointResolver != nil {
-			o.EndpointResolverV2 = endpointResolver
-		}
-		// Deprecated way (prefer EndpointResolverV2 if possible):
-		// if connStr == "localstack" {
-		// 	o.BaseEndpoint = aws.String("http://localhost:4566")
-		// }
-	})
+            o.EndpointResolverV2 = dynamodbstreams.EndpointResolverV2Func(
+                func(ctx context.Context, params dynamodbstreams.EndpointParameters) (smithyendpoints.Endpoint, error) {
+                    uri, err := aws.ParseURL(localstackEndpoint)
+                    if err != nil {
+                        return smithyendpoints.Endpoint{}, fmt.Errorf("failed to parse localstack endpoint URL: %w", err)
+                    }
+                    return smithyendpoints.Endpoint{
+                        URI: *uri,
+                        Properties: smithyendpoints.Properties{
+                            "authSchemes": []smithyendpoints.AuthScheme{
+                                {
+                                    Name:          "sigv4",
+                                    SigningName:   aws.String("dynamodb"),
+                                    SigningRegion: aws.String(effectiveConfig.Region),
+                                },
+                            },
+                        },
+                    }, nil
+                })
+        }
+    })
 
-	// 9. Create the DynamoDB Streams client using the effectiveConfig
-	streamsClient := dynamodbstreams.NewFromConfig(effectiveConfig, func(o *dynamodbstreams.Options) {
-		if endpointResolver != nil {
-			o.EndpointResolverV2 = endpointResolver
-		}
-		// Deprecated way:
-		// if connStr == "localstack" {
-		// 	o.BaseEndpoint = aws.String("http://localhost:4566")
-		// }
-	})
-
-	return dynamoClient, streamsClient
+    return dynamoClient, streamsClient
 }
 
 type Options struct {
